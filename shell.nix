@@ -1,0 +1,23 @@
+{ pkgs ? import <nixpkgs> {} }:
+
+pkgs.mkShell {
+  buildInputs = with pkgs; [
+    gcc
+    python310Packages.jupyterlab
+    python310Packages.pytorch
+    python310Packages.pyrsistent
+    python310Packages.mypy
+    python310Packages.pydantic
+    python310Packages.torchvision
+    python310Packages.tkinter
+    python310Packages.matplotlib
+    python310Packages.pyqt6-sip
+    python310Packages.pygobject3
+    python310Packages.tqdm
+    python310Packages.transformers
+    python310Packages.datasets
+    python310Packages.scikit-learn
+    gobject-introspection
+    gtk3 
+  ];
+}
