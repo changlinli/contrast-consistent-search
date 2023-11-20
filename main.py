@@ -1,19 +1,18 @@
+import copy
 from enum import Enum
+from typing import Literal
 
 import numpy
-from torch import tensor, Tensor
-from tqdm import tqdm
-import copy
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from datasets import load_dataset, Dataset
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForMaskedLM, AutoModelForCausalLM, \
-    PreTrainedTokenizerBase, TensorType, PreTrainedModel
-from sklearn.linear_model import LogisticRegression
 from sklearn.cluster import KMeans
+from torch import tensor, Tensor
+from tqdm import tqdm
+from transformers import AutoTokenizer, AutoModelForCausalLM, \
+    PreTrainedTokenizerBase, TensorType, PreTrainedModel
 
 
 def generate_text_from_model(
@@ -56,9 +55,9 @@ class Answer(Enum):
 def review_opinion_as_text(review_opinion: Answer) -> str:
     match review_opinion:
         case Answer.TRUE:
-            return "True"
+            return "Yes"
         case Answer.FALSE:
-            return "False"
+            return "No"
 
 
 def int_label_to_answer(label: int) -> Answer:
@@ -71,6 +70,13 @@ def int_label_to_answer(label: int) -> Answer:
             raise Exception("Got an unexpected label!")
 
 
+PROMPT_TEXT = \
+    "Give a one word answer of \"Yes\" or \"No\". Do the following reviews express a positive sentiment?\n" + \
+    "\"If you've played the game, you know how divine the music is! Every single song tells a story of the game in the most perfect way possible.\" Yes.\n" + \
+    "\"I guess you have to be a romance novel lover for this one, and not a very discerning one. All others beware! It is absolute drivel.\" No.\n" + \
+    "\"I feel I have to write to keep others from wasting their money. This book seems to have been written by a 7th grader with poor grammatical skills for her age! As another reviewer points out, there is a misspelling on the cover, and I believe there is at least one per chapter. For example, it was mentioned twice that she had a 'lean' on her house. I was so distracted by the poor writing and weak plot, that I decided to read with a pencil in hand to mark all of the horrible grammar and spelling. Please don't waste your money.\" No.\n"
+
+
 def create_prompt(text: str, label: Answer) -> str:
     """
     Given a review example ("text") and corresponding label (0 for negative, or 1
@@ -79,8 +85,7 @@ def create_prompt(text: str, label: Answer) -> str:
 
     (This is just one example of a simple, manually created prompt.)
     """
-    return "Give a one word answer of \"True\" or \"False\". Does the following movie review express a positive sentiment?\n" + \
-        text + "\n" + review_opinion_as_text(label)
+    return PROMPT_TEXT + "\"" + text.replace("\"", "'") + "\"" + " " + review_opinion_as_text(label)
 
 
 def get_hidden_states_multiple(model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase, data: Dataset, max_n: int):
@@ -126,13 +131,12 @@ class CCS(object):
             self,
             x0: numpy.ndarray,
             x1: numpy.ndarray,
-            nepochs=1000,
-            ntries=10,
-            lr=1e-3,
-            batch_size=-1,
-            verbose=False,
-            device="cuda",
-            linear=True,
+            nepochs: int = 1000,
+            ntries: int = 10,
+            lr: float = 1e-3,
+            batch_size: int = -1,
+            device: Literal["cpu", "cuda"] = "cuda",
+            single_layer=True,
             weight_decay=0.01,
             var_normalize=False,
     ):
@@ -142,15 +146,19 @@ class CCS(object):
             just needs to be the opposite of x1).
         @param x1: Hidden state representations of "negative" statement vectors (it doesn't really have to be negative,
             just needs to be the opposite of x0).
-        @param nepochs: The number of epochs we wish to train CSS for
-        @param ntries:
-        @param lr:
-        @param batch_size:
-        @param verbose:
-        @param device:
-        @param linear:
-        @param weight_decay:
-        @param var_normalize:
+        @param nepochs: The number of epochs we wish to train our probe's neural net for.
+        @param ntries: The number of times we will restart the training process to try to find the best set of weights
+            for our probe's neural net.
+        @param lr: Learning rate used for the Adam optimizer in gradient descent for the probe's neural net.
+        @param batch_size: Size of batches use for training the probe's neural net. Set to -1 if you want the entire
+            training set used as a single batch.
+        @param device: Which device will store the tensors.
+        @param single_layer: Whether we will have a single layer neural net or a multi-layer neural net used as our
+            probe.
+        @param weight_decay: Weight decay parameter for the Adam optimizer in gradient descent.
+        @param var_normalize: Whether to normalize the variance in our training set. Along with mean normalization
+            (without which CCS basically just doesn't work, so it's not set as an option), this is used to try to remove
+            the effect of the difference in the words themselves.
         """
         # data
         self.var_normalize = var_normalize
@@ -162,13 +170,12 @@ class CCS(object):
         self.nepochs = nepochs
         self.ntries = ntries
         self.lr = lr
-        self.verbose = verbose
         self.device = device
         self.batch_size = batch_size
         self.weight_decay = weight_decay
 
         # probe
-        self.linear = linear
+        self.linear = single_layer
         self.initialize_probe()
         self.best_probe = copy.deepcopy(self.probe)
 
@@ -297,16 +304,6 @@ def contrastive_pairs_with_k_means_on_text(
     return kmeans_predict_once(kmeans, cluster_truthiness, hidden_state)
 
 
-def evaluate_contrastive_pairs_with_k_means_on_hidden_representation(
-        kmeans: KMeans,
-        hidden_representation: torch.Tensor,
-        cluster_truthiness: ClusterTruth,
-) -> bool:
-    result_as_array: numpy.ndarray = kmeans.predict(hidden_representation.numpy())
-    # TODO
-    return True
-
-
 def evaluate_k_means_accuracy(
         negative_hidden_states_train: numpy.ndarray,
         positive_hidden_states_train: numpy.ndarray,
@@ -327,13 +324,20 @@ def evaluate_k_means_accuracy(
 def main():
     data: Dataset = load_dataset("amazon_polarity")["test"]
 
-    model_name = "EleutherAI/gpt-j-6b"
+    # Can try with GPT-J
+    # model_name = "EleutherAI/gpt-j-6B"
+    # tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(model_name)
+    # You'll probably want to use float16 because otherwise memory usage is huge
+    # model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(model_name, revision="float16", torch_dtype=torch.float16)
+    model_name = "gpt2-xl"
     print("Beginning to download tokenizer...")
     tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(model_name)
     print("Beginning to download model...")
     model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(model_name)
     print("Finished downloading model...")
-    example_text = generate_text_from_model(model, tokenizer, "Hello today is ", 10)
+    example_text_prompt = \
+        PROMPT_TEXT + "\"" + "This soundtrack is my favorite music of all time, hands down." + "\"\n"
+    example_text = generate_text_from_model(model, tokenizer, example_text_prompt, 500)
     print(f"Example text generated from the model: {example_text}")
 
     num_of_examples = 100
