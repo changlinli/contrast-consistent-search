@@ -22,7 +22,7 @@ def generate_text_from_model(
         max_length: int,
 ) -> str:
     tokens = tokenizer(prompt, return_tensors=TensorType.PYTORCH).input_ids.to(model.device)
-    outputs = model.generate(tokens)
+    outputs = model.generate(tokens, max_length=max_length)
     return tokenizer.batch_decode(outputs, skip_special_tokens=True)[0]
 
 
@@ -279,12 +279,16 @@ class ClusterTruth(Enum):
     CLUSTER_1_IS_TRUTH = 2
 
 
+trivially_positive_review = "This book was amazing! It's the best thing I have ever read in my entire life. I am so " \
+                            "happy after reading this."
+
+
 def kmeans_predict_once(
         kmeans: KMeans,
         cluster_truthiness: ClusterTruth,
-        input_vector: torch.Tensor,
+        input_vector: numpy.ndarray,
 ) -> bool:
-    result_as_array: numpy.ndarray = kmeans.predict([input_vector.numpy()])
+    result_as_array: numpy.ndarray = kmeans.predict([input_vector])
     result_as_int = result_as_array[0]
     match cluster_truthiness:
         case ClusterTruth.CLUSTER_0_IS_TRUTH:
@@ -301,69 +305,80 @@ def contrastive_pairs_with_k_means_on_text(
         input_text: str,
 ) -> bool:
     hidden_state = get_hidden_state_of_last_layer_last_token(model, tokenizer, input_text)
-    return kmeans_predict_once(kmeans, cluster_truthiness, hidden_state)
+    return kmeans_predict_once(kmeans, cluster_truthiness, hidden_state.numpy())
 
 
 def evaluate_k_means_accuracy(
-        negative_hidden_states_train: numpy.ndarray,
-        positive_hidden_states_train: numpy.ndarray,
-        negative_hidden_states_test: numpy.ndarray,
-        positive_hidden_states_test: numpy.ndarray,
+        hidden_states_train: numpy.ndarray,
+        hidden_states_test: numpy.ndarray,
         ground_truth_labels: numpy.ndarray,
-):
+) -> float:
     # We just throw it all together into K-Means and see what comes out
     kmeans = KMeans(n_clusters=2)
-    kmeans.fit(negative_hidden_states_train + positive_hidden_states_train)
+    kmeans.fit(hidden_states_train.astype('float'))
     cluster_truthiness = ClusterTruth.CLUSTER_0_IS_TRUTH
-    output = [(kmeans_predict_once(kmeans, cluster_truthiness, negative_hidden_state), ground_truth) for
-              negative_hidden_state, positive_hidden_state, ground_truth in
-              zip(negative_hidden_states_test, positive_hidden_states_test, ground_truth_labels)]
-    print(output)
+    output = [(kmeans_predict_once(kmeans, cluster_truthiness, hidden_state), ground_truth) for
+              hidden_state, ground_truth in
+              zip(hidden_states_test, ground_truth_labels)]
+    accuracy = len(list(filter(lambda x: x[0] == x[1], output))) / len(output)
+    print(f"{accuracy=}")
+    return accuracy
+
+
+k_means_train_data = torch.rand((100, 50), dtype=torch.float)
+k_means_test_data = torch.rand((200, 50), dtype=torch.float)
+ground_truth_labels = tensor([i < 0.5 for i in torch.rand(200, dtype=torch.float)])
 
 
 def main():
-    data: Dataset = load_dataset("amazon_polarity")["test"]
-
-    # Can try with GPT-J
-    # model_name = "EleutherAI/gpt-j-6B"
-    # tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(model_name)
-    # You'll probably want to use float16 because otherwise memory usage is huge
-    # model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(model_name, revision="float16", torch_dtype=torch.float16)
-    model_name = "gpt2-xl"
-    print("Beginning to download tokenizer...")
-    tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(model_name)
-    print("Beginning to download model...")
-    model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(model_name)
-    print("Finished downloading model...")
-    example_text_prompt = \
-        PROMPT_TEXT + "\"" + "This soundtrack is my favorite music of all time, hands down." + "\"\n"
-    example_text = generate_text_from_model(model, tokenizer, example_text_prompt, 500)
-    print(f"Example text generated from the model: {example_text}")
-
-    num_of_examples = 100
-    negative_hidden_states, positive_hidden_states, ground_truth_labels = \
-        get_hidden_states_multiple(model, tokenizer, data, num_of_examples)
-    negative_hidden_states_train = negative_hidden_states[:num_of_examples // 2]
-    negative_hidden_states_test = negative_hidden_states[num_of_examples // 2:]
-    positive_hidden_states_train = positive_hidden_states[:num_of_examples // 2]
-    positive_hidden_states_test = positive_hidden_states[num_of_examples // 2:]
-    # We don't need a ground truth train because we aren't using ground truth in training!
-    ground_truth_test = ground_truth_labels[num_of_examples // 2:]
-    ccs = CCS(negative_hidden_states_train, positive_hidden_states_train)
-    print("Beginning CCS training...")
-    ccs.repeated_train()
-
-    ccs_acc = ccs.get_acc(negative_hidden_states_test, positive_hidden_states_test, ground_truth_test)
-    print("CCS accuracy: {}".format(ccs_acc))
+    print(f"{k_means_test_data=}")
     evaluate_k_means_accuracy(
-        negative_hidden_states_test=negative_hidden_states_test,
-        positive_hidden_states_test=positive_hidden_states_test,
-        negative_hidden_states_train=negative_hidden_states_train,
-        positive_hidden_states_train=positive_hidden_states_train,
-        ground_truth_labels=ground_truth_test
+        hidden_states_train=k_means_train_data.numpy(),
+        hidden_states_test=k_means_test_data.numpy(),
+        ground_truth_labels=ground_truth_labels.numpy(),
     )
-
-    print("Hello world!")
+    # data: Dataset = load_dataset("amazon_polarity")["test"]
+    #
+    # # Can try with GPT-J
+    # # model_name = "EleutherAI/gpt-j-6B"
+    # # tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(model_name)
+    # # You'll probably want to use float16 because otherwise memory usage is huge
+    # # model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(model_name, revision="float16", torch_dtype=torch.float16)
+    # model_name = "gpt2-xl"
+    # print("Beginning to download tokenizer...")
+    # tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(model_name)
+    # print("Beginning to download model...")
+    # model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(model_name)
+    # print("Finished downloading model...")
+    # example_text_prompt = \
+    #     PROMPT_TEXT + "\"" + "This soundtrack is my favorite music of all time, hands down." + "\"\n"
+    # example_text = generate_text_from_model(model, tokenizer, example_text_prompt, 500)
+    # print(f"Example text generated from the model: {example_text}")
+    #
+    # num_of_examples = 100
+    # negative_hidden_states, positive_hidden_states, ground_truth_labels = \
+    #     get_hidden_states_multiple(model, tokenizer, data, num_of_examples)
+    # negative_hidden_states_train = negative_hidden_states[:num_of_examples // 2]
+    # negative_hidden_states_test = negative_hidden_states[num_of_examples // 2:]
+    # positive_hidden_states_train = positive_hidden_states[:num_of_examples // 2]
+    # positive_hidden_states_test = positive_hidden_states[num_of_examples // 2:]
+    # # We don't need a ground truth train because we aren't using ground truth in training!
+    # ground_truth_test = ground_truth_labels[num_of_examples // 2:]
+    # # ccs = CCS(negative_hidden_states_train, positive_hidden_states_train)
+    # # print("Beginning CCS training...")
+    # # ccs.repeated_train()
+    # #
+    # # ccs_acc = ccs.get_acc(negative_hidden_states_test, positive_hidden_states_test, ground_truth_test)
+    # # print("CCS accuracy: {}".format(ccs_acc))
+    # evaluate_k_means_accuracy(
+    #     negative_hidden_states_test=negative_hidden_states_test,
+    #     positive_hidden_states_test=positive_hidden_states_test,
+    #     negative_hidden_states_train=negative_hidden_states_train,
+    #     positive_hidden_states_train=positive_hidden_states_train,
+    #     ground_truth_labels=ground_truth_test
+    # )
+    #
+    # print("Hello world!")
 
 
 if __name__ == "__main__":
